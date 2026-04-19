@@ -17,15 +17,26 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 # ---------------------------------------------------------------------------
-# Configuration — edit these or override via environment variables
+# Configuration — loaded from config.json (created by setup.py),
+# with environment variables as overrides.
 # ---------------------------------------------------------------------------
-ALBUM_ID = os.environ.get("ALBUM_ID", "YOUR_ALBUM_ID_HERE")
-DEVICE_MODEL = os.environ.get("DEVICE_MODEL", "Pixel 8")
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "30"))          # seconds
+CONFIG_FILE = Path("config.json")
+
+def _load_config() -> dict:
+    """Load config.json produced by setup.py, if it exists."""
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {}
+
+_cfg = _load_config()
+
+ALBUM_ID        = os.environ.get("ALBUM_ID",        _cfg.get("album_id",        ""))
+DEVICE_MODEL    = os.environ.get("DEVICE_MODEL",    _cfg.get("device_model",    "Pixel 8"))
+POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", str(_cfg.get("poll_interval", 30))))
 CHECKPOINT_FILE = Path(os.environ.get("CHECKPOINT_FILE", "checkpoint.json"))
-CREDENTIALS_FILE = Path(os.environ.get("CREDENTIALS_FILE", "credentials.json"))
-TOKEN_FILE = Path(os.environ.get("TOKEN_FILE", "token.json"))
-PAGE_SIZE = 100                                                       # max per API call
+CREDENTIALS_FILE = Path(os.environ.get("CREDENTIALS_FILE", _cfg.get("credentials_file", "credentials.json")))
+TOKEN_FILE      = Path(os.environ.get("TOKEN_FILE",  "token.json"))
+PAGE_SIZE       = 100                                                 # max per API call
 
 SCOPES = ["https://www.googleapis.com/auth/photoslibrary"]
 
@@ -243,9 +254,11 @@ def poll(creds: Credentials, since: datetime) -> datetime:
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    if ALBUM_ID == "YOUR_ALBUM_ID_HERE":
+    if not ALBUM_ID:
         raise SystemExit(
-            "Set the ALBUM_ID environment variable (or edit the constant at the top of monitor.py)."
+            "No album ID configured.\n"
+            "Run the setup wizard first:\n\n"
+            "    python setup.py\n"
         )
 
     log.info("=== Google Photos Monitor starting ===")

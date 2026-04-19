@@ -1,6 +1,7 @@
 credentials.json
 token.json
 checkpoint.json
+config.json
 __pycache__/
 *.pyc
 .env
