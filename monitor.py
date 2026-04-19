@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Google Photos monitor — watches for new photos from a specific device
-and adds them to a target album in near real-time.
+Google Photos monitor (Drive API edition) — watches for new photos from a
+specific device in the Drive-synced Google Photos folder and copies them
+into a target Drive folder in near real-time.
 """
 
 import json
@@ -11,36 +12,35 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import requests
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # ---------------------------------------------------------------------------
-# Configuration — loaded from config.json (created by setup.py),
-# with environment variables as overrides.
+# Configuration — loaded from config.json (created by setup.py)
 # ---------------------------------------------------------------------------
 CONFIG_FILE = Path("config.json")
 
+
 def _load_config() -> dict:
-    """Load config.json produced by setup.py, if it exists."""
     if CONFIG_FILE.exists():
         return json.loads(CONFIG_FILE.read_text())
     return {}
 
+
 _cfg = _load_config()
 
-ALBUM_ID        = os.environ.get("ALBUM_ID",        _cfg.get("album_id",        ""))
-DEVICE_MODEL    = os.environ.get("DEVICE_MODEL",    _cfg.get("device_model",    "Pixel 8"))
-POLL_INTERVAL   = int(os.environ.get("POLL_INTERVAL", str(_cfg.get("poll_interval", 30))))
-CHECKPOINT_FILE = Path(os.environ.get("CHECKPOINT_FILE", "checkpoint.json"))
+SOURCE_FOLDER_ID = os.environ.get("SOURCE_FOLDER_ID", _cfg.get("source_folder_id", ""))
+TARGET_FOLDER_ID = os.environ.get("TARGET_FOLDER_ID", _cfg.get("target_folder_id", ""))
+DEVICE_MODEL     = os.environ.get("DEVICE_MODEL",     _cfg.get("device_model",     "Pixel 8"))
+POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL", str(_cfg.get("poll_interval", 30))))
 CREDENTIALS_FILE = Path(os.environ.get("CREDENTIALS_FILE", _cfg.get("credentials_file", "credentials.json")))
-TOKEN_FILE      = Path(os.environ.get("TOKEN_FILE",  "token.json"))
-PAGE_SIZE       = 100                                                 # max per API call
+CHECKPOINT_FILE  = Path(os.environ.get("CHECKPOINT_FILE", "checkpoint.json"))
+TOKEN_FILE       = Path("token.json")
 
-SCOPES = ["https://www.googleapis.com/auth/photoslibrary"]
-
-BASE_URL = "https://photoslibrary.googleapis.com/v1"
+SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -56,10 +56,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-def get_credentials() -> Credentials:
-    """Load or refresh OAuth2 credentials, running the browser flow if needed."""
+def get_service():
     creds = None
-
     if TOKEN_FILE.exists():
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
@@ -70,30 +68,27 @@ def get_credentials() -> Credentials:
         else:
             if not CREDENTIALS_FILE.exists():
                 raise FileNotFoundError(
-                    f"OAuth client secrets file not found: {CREDENTIALS_FILE}\n"
-                    "Download it from Google Cloud Console → APIs & Services → Credentials."
+                    f"OAuth client secrets not found: {CREDENTIALS_FILE}\n"
+                    "Run python3 setup.py first."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
             creds = flow.run_local_server(port=0)
             log.info("Authentication successful.")
-
         TOKEN_FILE.write_text(creds.to_json())
 
-    return creds
+    return build("drive", "v3", credentials=creds)
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint helpers
+# Checkpoint
 # ---------------------------------------------------------------------------
 def load_checkpoint() -> datetime:
-    """Return the last processed timestamp, or 'now' on first run."""
     if CHECKPOINT_FILE.exists():
         data = json.loads(CHECKPOINT_FILE.read_text())
         ts = datetime.fromisoformat(data["last_processed_timestamp"])
         log.info("Resuming from checkpoint: %s", ts.isoformat())
         return ts
 
-    # First run — only pick up photos taken from this moment forward.
     ts = datetime.now(timezone.utc)
     save_checkpoint(ts)
     log.info("No checkpoint found. Starting from now: %s", ts.isoformat())
@@ -107,143 +102,80 @@ def save_checkpoint(ts: datetime) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Google Photos API helpers
+# Drive helpers
 # ---------------------------------------------------------------------------
-def _auth_session(creds: Credentials) -> requests.Session:
-    """Return a requests Session with a valid Bearer token header."""
-    # Refresh if needed before building the header
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        TOKEN_FILE.write_text(creds.to_json())
-
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {creds.token}"})
-    return session
-
-
-def search_media_items(
-    session: requests.Session,
-    after: datetime,
-    page_token: str | None = None,
-) -> dict:
+def list_new_photos(service, since: datetime) -> list[dict]:
     """
-    Call mediaItems.search with a date filter covering [after, now].
-    Returns the raw API response dict.
+    List image files in the source folder created after `since`,
+    including their imageMediaMetadata for camera model filtering.
     """
-    now = datetime.now(timezone.utc)
-
-    body: dict = {
-        "pageSize": PAGE_SIZE,
-        "filters": {
-            "dateFilter": {
-                "ranges": [
-                    {
-                        "startDate": {
-                            "year": after.year,
-                            "month": after.month,
-                            "day": after.day,
-                        },
-                        "endDate": {
-                            "year": now.year,
-                            "month": now.month,
-                            "day": now.day,
-                        },
-                    }
-                ]
-            },
-            "mediaTypeFilter": {"mediaTypes": ["PHOTO"]},
-        },
-    }
-
-    if page_token:
-        body["pageToken"] = page_token
-
-    resp = session.post(f"{BASE_URL}/mediaItems:search", json=body, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_media_item(session: requests.Session, media_item_id: str) -> dict:
-    """Fetch full metadata for a single media item (needed for EXIF model tag)."""
-    resp = session.get(f"{BASE_URL}/mediaItems/{media_item_id}", timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def batch_add_to_album(
-    session: requests.Session, album_id: str, media_item_ids: list[str]
-) -> None:
-    """Add up to 50 media items to an album in one call."""
-    # API limit: max 50 items per batchAdd call
-    chunk_size = 50
-    for i in range(0, len(media_item_ids), chunk_size):
-        chunk = media_item_ids[i : i + chunk_size]
-        body = {"mediaItemIds": chunk}
-        resp = session.post(
-            f"{BASE_URL}/albums/{album_id}:batchAddMediaItems",
-            json=body,
-            timeout=30,
-        )
-        resp.raise_for_status()
-
-
-# ---------------------------------------------------------------------------
-# Core logic
-# ---------------------------------------------------------------------------
-def matches_device(item: dict, model: str) -> bool:
-    """Return True if the item's camera model matches (case-insensitive)."""
-    photo_meta = (
-        item.get("mediaMetadata", {})
-        .get("photo", {})
+    since_str = since.strftime("%Y-%m-%dT%H:%M:%S")
+    query = (
+        f"mimeType contains 'image/' "
+        f"and trashed = false "
+        f"and createdTime > '{since_str}'"
     )
-    item_model = photo_meta.get("cameraModel", "")
-    return item_model.lower() == model.lower()
+    if SOURCE_FOLDER_ID:
+        query += f" and '{SOURCE_FOLDER_ID}' in parents"
 
-
-def creation_time(item: dict) -> datetime:
-    raw = item.get("mediaMetadata", {}).get("creationTime", "")
-    return datetime.fromisoformat(raw.replace("Z", "+00:00")) if raw else datetime.min.replace(tzinfo=timezone.utc)
-
-
-def poll(creds: Credentials, since: datetime) -> datetime:
-    """
-    One poll cycle. Returns the updated 'since' timestamp (the newest item seen,
-    or the original value if nothing new was found).
-    """
-    log.info("Searching for new photos since %s (device: %s)...", since.isoformat(), DEVICE_MODEL)
-
-    session = _auth_session(creds)
-    matched_ids: list[str] = []
-    newest_ts = since
-    page_token: str | None = None
-
+    files = []
+    page_token = None
     while True:
-        data = search_media_items(session, after=since, page_token=page_token)
-        items = data.get("mediaItems", [])
-
-        for item in items:
-            item_ts = creation_time(item)
-
-            # Skip anything not newer than our checkpoint
-            if item_ts <= since:
-                continue
-
-            # The search result includes basic photo metadata; cameraModel is included.
-            if matches_device(item, DEVICE_MODEL):
-                matched_ids.append(item["id"])
-                log.debug("  Match: %s  [%s]", item.get("filename"), item_ts.isoformat())
-
-            if item_ts > newest_ts:
-                newest_ts = item_ts
-
-        page_token = data.get("nextPageToken")
+        resp = service.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, createdTime, imageMediaMetadata)",
+            pageSize=100,
+            orderBy="createdTime asc",
+            pageToken=page_token,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
         if not page_token:
             break
 
-    if matched_ids:
-        log.info("Found %d new photo(s) from '%s'. Adding to album...", len(matched_ids), DEVICE_MODEL)
-        batch_add_to_album(session, ALBUM_ID, matched_ids)
-        log.info("Successfully added %d photo(s) to album.", len(matched_ids))
+    return files
+
+
+def matches_device(file: dict, model: str) -> bool:
+    item_model = (file.get("imageMediaMetadata") or {}).get("cameraModel", "")
+    return item_model.lower() == model.lower()
+
+
+def copy_to_target(service, file_id: str, target_folder_id: str) -> None:
+    """Add the file to the target folder (without removing it from source)."""
+    service.files().update(
+        fileId=file_id,
+        addParents=target_folder_id,
+        fields="id, parents",
+    ).execute()
+
+
+# ---------------------------------------------------------------------------
+# Poll cycle
+# ---------------------------------------------------------------------------
+def poll(service, since: datetime) -> datetime:
+    log.info("Searching for new photos since %s (device: %s)...", since.isoformat(), DEVICE_MODEL)
+
+    files = list_new_photos(service, since)
+    newest_ts = since
+    matched = []
+
+    for f in files:
+        raw_ts = f.get("createdTime", "")
+        file_ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")) if raw_ts else since
+
+        if file_ts > newest_ts:
+            newest_ts = file_ts
+
+        if matches_device(f, DEVICE_MODEL):
+            matched.append(f)
+            log.debug("  Match: %s [%s]", f.get("name"), file_ts.isoformat())
+
+    if matched:
+        log.info("Found %d new photo(s) from '%s'. Adding to folder...", len(matched), DEVICE_MODEL)
+        for f in matched:
+            copy_to_target(service, f["id"], TARGET_FOLDER_ID)
+        log.info("Successfully added %d photo(s) to target folder.", len(matched))
     else:
         log.info("No new matching photos found.")
 
@@ -254,40 +186,41 @@ def poll(creds: Credentials, since: datetime) -> datetime:
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
-    if not ALBUM_ID:
+    if not TARGET_FOLDER_ID:
         raise SystemExit(
-            "No album ID configured.\n"
+            "No target folder configured.\n"
             "Run the setup wizard first:\n\n"
-            "    python setup.py\n"
+            "    python3 setup.py\n"
         )
 
-    log.info("=== Google Photos Monitor starting ===")
-    log.info("  Album ID    : %s", ALBUM_ID)
-    log.info("  Device model: %s", DEVICE_MODEL)
+    log.info("=== Google Photos Monitor (Drive API) starting ===")
+    log.info("  Source folder: %s", SOURCE_FOLDER_ID or "all of Drive")
+    log.info("  Target folder: %s", TARGET_FOLDER_ID)
+    log.info("  Device model : %s", DEVICE_MODEL)
     log.info("  Poll interval: %ds", POLL_INTERVAL)
 
-    creds = get_credentials()
+    service = get_service()
     since = load_checkpoint()
 
     while True:
         try:
-            newest = poll(creds, since)
+            newest = poll(service, since)
             if newest > since:
                 since = newest
                 save_checkpoint(since)
-        except requests.exceptions.Timeout:
-            log.warning("Request timed out — will retry next cycle.")
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "?"
+        except HttpError as exc:
+            status = exc.resp.status
             if status == 429:
-                log.warning("API quota limit hit (429). Backing off for 60s...")
+                log.warning("API quota limit (429). Backing off 60s...")
                 time.sleep(60)
             elif status in (500, 502, 503, 504):
-                log.warning("Server error (%s). Will retry next cycle.", status)
+                log.warning("Server error (%s). Retrying next cycle.", status)
             else:
                 log.error("HTTP error %s: %s", status, exc)
-        except requests.exceptions.ConnectionError:
-            log.warning("Network connection error — will retry next cycle.")
+        except TimeoutError:
+            log.warning("Request timed out — retrying next cycle.")
+        except ConnectionError:
+            log.warning("Network error — retrying next cycle.")
         except Exception as exc:  # noqa: BLE001
             log.exception("Unexpected error: %s", exc)
 
